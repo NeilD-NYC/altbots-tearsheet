@@ -1,0 +1,10 @@
+.env
+output/
+*.pdf
+__pycache__/
+venv/
+node_modules/
+*.pyc
+.DS_Store
+qdrant_data/
+backups/

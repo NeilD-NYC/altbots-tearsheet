@@ -1,0 +1,14 @@
+pydantic
+fastapi
+uvicorn[standard]
+reportlab
+pillow
+requests
+python-dotenv
+openai
+anthropic
+exa-py            # Exa.ai neural search SDK (optional — module falls back to REST)
+qdrant-client
+edgartools
+tabulate          # required by edgartools for .to_markdown() on DataFrames
+pandas            # transitive dep of edgartools; explicit pin for 13F parsing
