@@ -8,3 +8,7 @@ node_modules/
 .DS_Store
 qdrant_data/
 backups/
+data/
+logs/
+fixtures/
+config/api_keys.json

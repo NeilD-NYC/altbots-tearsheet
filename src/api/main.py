@@ -29,6 +29,7 @@ from pydantic import BaseModel, field_validator
 
 from src.core.assembler import TearsheetAssembler, IdentityResolutionError
 from src.renderers.pdf_renderer import render_tearsheet
+from src.mcp.server import mcp_server, sse_transport
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,42 @@ def _error(status: int, code: str, message: str) -> JSONResponse:
 def health() -> dict:
     """Liveness probe."""
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# MCP endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/sse", tags=["mcp"])
+async def handle_sse(request: Request):
+    """SSE endpoint for MCP clients (Claude Desktop, Cursor, etc.)."""
+    async with sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await mcp_server.run(
+            streams[0], streams[1], mcp_server.create_initialization_options()
+        )
+
+
+@app.post("/messages/", tags=["mcp"])
+async def handle_messages(request: Request):
+    """Post-message endpoint used by the MCP SSE transport."""
+    await sse_transport.handle_post_message(
+        request.scope, request.receive, request._send
+    )
+
+
+@app.get("/mcp/info", tags=["mcp"])
+async def mcp_info() -> dict:
+    """Tool schema for agent discovery."""
+    return {
+        "name": "altbots-manager-research-signals",
+        "version": "1.0.0",
+        "description": "Institutional-grade fund manager research signal reports",
+        "tools": ["generate_manager_tearsheet"],
+        "disclosure": "All responses include mandatory legal disclosure envelope",
+        "server_url": "https://mcp.altbots.io/sse",
+    }
 
 
 @app.post("/generate", response_model=GenerateResponse, tags=["tearsheet"])
