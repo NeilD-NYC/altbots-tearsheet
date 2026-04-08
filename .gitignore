@@ -12,3 +12,5 @@ data/
 logs/
 fixtures/
 config/api_keys.json
+.claude/
+gap_list.txt

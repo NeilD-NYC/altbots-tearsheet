@@ -435,11 +435,22 @@ class TearsheetAssembler:
         elif module == _MODULE_PERSONNEL:
             tearsheet.personnel = result or []
             if tearsheet.personnel:
+                tier2 = sum(1 for p in tearsheet.personnel if getattr(p, "source_tier", 1) == 2)
+                source_detail = (
+                    f"Firecrawl / Proxycurl ({tier2} via Proxycurl) / Claude Haiku"
+                    if tier2 else "Firecrawl / Claude Haiku"
+                )
                 envelope.add_source(
-                    f"PersonnelEnricher (Firecrawl / Proxycurl / Claude Haiku) "
+                    f"PersonnelEnricher ({source_detail}) "
                     f"— {len(tearsheet.personnel)} profile(s)"
                 )
-            logger.info("[Assembler:Step2] Personnel enrichment complete — %d profile(s)", len(tearsheet.personnel))
+            logger.info(
+                "[Assembler:Step2] Personnel enrichment complete — %d profile(s) "
+                "(%d tier-1 Firecrawl, %d tier-2 Proxycurl)",
+                len(tearsheet.personnel),
+                sum(1 for p in tearsheet.personnel if getattr(p, "source_tier", 1) == 1),
+                sum(1 for p in tearsheet.personnel if getattr(p, "source_tier", 1) == 2),
+            )
 
         elif module == _MODULE_SOCIAL:
             tearsheet.social_signals = result or []

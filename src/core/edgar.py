@@ -195,6 +195,13 @@ class ADVData:
     registration_status: str = ""
     crd_number: Optional[str] = None
 
+    # ── Strategy & Service Providers (Schedule D §7.B.(1)) ────────────────────
+    strategy_type: Optional[str] = None        # e.g. "Hedge Fund"
+    auditor: Optional[str] = None              # auditing firm name
+    prime_brokers: list = field(default_factory=list)   # list of str
+    custodians: list = field(default_factory=list)      # list of str
+    fund_administrator: Optional[str] = None   # fund admin name
+
     def to_dict(self) -> dict:
         return {
             "source": self.source.to_dict(),
@@ -219,6 +226,15 @@ class ADVData:
                 "sec_registered": self.sec_registered,
                 "status": self.registration_status,
                 "crd_number": self.crd_number,
+            },
+            "strategy": {
+                "strategy_type": self.strategy_type,
+            },
+            "service_providers": {
+                "auditor": self.auditor,
+                "prime_brokers": self.prime_brokers,
+                "custodians": self.custodians,
+                "fund_administrator": self.fund_administrator,
             },
         }
 
@@ -385,6 +401,13 @@ def _dict_to_all_filings_data(d: dict) -> "AllFilingsData":
         obj.fee_source                = fees.get("source", "")
         obj.registration_status       = reg.get("status", "")
         obj.crd_number                = reg.get("crd_number")
+        strategy = a.get("strategy", {})
+        sp       = a.get("service_providers", {})
+        obj.strategy_type      = strategy.get("strategy_type")
+        obj.auditor            = sp.get("auditor")
+        obj.prime_brokers      = sp.get("prime_brokers", [])
+        obj.custodians         = sp.get("custodians", [])
+        obj.fund_administrator = sp.get("fund_administrator")
         return obj
 
     def _holding(h: dict, filing_source: FilingSource) -> Holding:
@@ -704,6 +727,78 @@ class EDGARFetcher:
         # Registration
         adv.registration_status = str(rgstn[0].get("St", "") if rgstn else "")
         adv.crd_number = crd_val or None
+
+        # Strategy — Item 5.G (business activities)
+        item5g = part1a.get("Item5G") or {}
+        _item5g_labels = {
+            "Q5G1":  "Investment Management",
+            "Q5G2":  "Financial Planning",
+            "Q5G3":  "Portfolio Management",
+            "Q5G4":  "Pension Consulting",
+            "Q5G5":  "Securities Selection",
+            "Q5G6":  "Investment Adviser Representative",
+            "Q5G7":  "Educational Seminars/Workshops",
+            "Q5G8":  "Other",
+        }
+        active_activities = [
+            label for key, label in _item5g_labels.items()
+            if item5g.get(key) == "Y"
+        ]
+        if active_activities:
+            adv.strategy_type = active_activities[0]   # primary activity
+
+        # Schedule D §7.B.(1) — private fund service providers
+        # Structure: FormInfo.ScheduleD.Section7B1.PrivateFunds[*]
+        sched_d   = f.get("FormInfo", {}).get("ScheduleD", {})
+        sec7b1    = sched_d.get("Section7B1") or sched_d.get("Sec7B1") or {}
+        pf_list   = sec7b1.get("PrivateFunds") or sec7b1.get("PrivateFundsList") or []
+        if isinstance(pf_list, dict):
+            pf_list = [pf_list]
+
+        auditors: list[str]       = []
+        prime_brokers: list[str]  = []
+        custodians: list[str]     = []
+        fund_admins: list[str]    = []
+
+        for pf in pf_list:
+            # Auditor
+            aud_nm = pf.get("AudNm") or pf.get("AuditorName") or ""
+            if aud_nm and aud_nm not in auditors:
+                auditors.append(str(aud_nm).strip())
+
+            # Strategy type from fund type
+            fund_type = pf.get("TypeFund") or pf.get("FundType") or ""
+            if fund_type and not adv.strategy_type:
+                adv.strategy_type = str(fund_type).strip()
+
+            # Prime brokers
+            for pb in (pf.get("PBInfo") or pf.get("PrimeBrokerInfo") or []):
+                nm = pb.get("PBNm") or pb.get("PrimeBrokerName") or ""
+                if nm and nm not in prime_brokers:
+                    prime_brokers.append(str(nm).strip())
+
+            # Custodians
+            for cust in (pf.get("CustInfo") or pf.get("CustodianInfo") or []):
+                nm = cust.get("CustNm") or cust.get("CustodianName") or ""
+                if nm and nm not in custodians:
+                    custodians.append(str(nm).strip())
+
+            # Fund administrators
+            for fa in (pf.get("FundAdminInfo") or pf.get("FundAdministratorInfo") or []):
+                nm = fa.get("FundAdminNm") or fa.get("FundAdministratorName") or ""
+                if nm and nm not in fund_admins:
+                    fund_admins.append(str(nm).strip())
+
+        adv.auditor            = auditors[0] if auditors else None
+        adv.prime_brokers      = prime_brokers
+        adv.custodians         = custodians
+        adv.fund_administrator = fund_admins[0] if fund_admins else None
+
+        logger.info(
+            f"[EDGAR] ADV schedule-D: strategy={adv.strategy_type!r}  "
+            f"auditor={adv.auditor!r}  prime_brokers={adv.prime_brokers}  "
+            f"custodians={adv.custodians}  fund_admin={adv.fund_administrator!r}"
+        )
 
         attribution = f"Form ADV Part 1A, filed {filing_date} (CRD {crd_val})"
         adv.aum_source = adv.client_source = adv.fee_source = attribution

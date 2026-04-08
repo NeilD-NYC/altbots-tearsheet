@@ -347,11 +347,17 @@ class SocialSignalScanner:
                 },
                 timeout=30,
             )
-            if resp.status_code == 402:
+            if resp.status_code in (402, 429):
                 self._fc_tripped = True
+                reason = (
+                    "402 Payment Required — quota exhausted"
+                    if resp.status_code == 402
+                    else "429 Rate Limited — too many requests"
+                )
                 logger.warning(
-                    "[Social] Firecrawl 402 Payment Required — circuit breaker tripped; "
-                    "skipping all remaining Firecrawl calls and falling through to Exa"
+                    "[Social] Firecrawl %s — circuit breaker tripped; "
+                    "pivoting to Exa.ai only for this run",
+                    reason,
                 )
                 return []
             resp.raise_for_status()

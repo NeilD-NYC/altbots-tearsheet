@@ -297,8 +297,56 @@ class RedFlagScanner:
         return findings
 
     # ------------------------------------------------------------------
-    # SEC enforcement release search
+    # SEC enforcement release search (public API)
     # ------------------------------------------------------------------
+
+    def fetch_litigation_releases(self, firm_name: str) -> list[dict]:
+        """
+        Search SEC Litigation Releases (34-LR), Administrative Proceedings
+        (34-AP), and cease-and-desist orders (IC-AP) for the firm name.
+
+        Returns a list of dicts with keys: date, type, summary, url.
+        Returns an empty list if nothing is found or the search fails.
+        """
+        results: list[dict] = []
+        enforcement_forms = "34-AP,34-LR,IC-AP"
+        query = urllib.parse.quote(f'"{firm_name}"')
+        url = (
+            f"https://efts.sec.gov/LATEST/search-index"
+            f"?q={query}&forms={enforcement_forms}&dateRange=custom"
+            f"&startdt=2000-01-01"
+        )
+        data = _safe_get(url, timeout=self.timeout)
+        if not data:
+            return results
+
+        hits = data.get("hits", {}).get("hits", [])
+        for hit in hits[:10]:
+            src        = hit.get("_source", {})
+            file_date  = str(src.get("file_date") or "")[:10]
+            form_type  = str(src.get("form_type") or "SEC enforcement record")
+            entity     = str(src.get("entity_name") or firm_name)
+            accession  = hit.get("_id", "").replace(":", "/")
+            filing_url = (
+                f"https://www.sec.gov/Archives/edgar/data/{accession}"
+                if accession
+                else f"https://efts.sec.gov/LATEST/search-index?q={query}&forms={enforcement_forms}"
+            )
+            summary = (
+                f"SEC {form_type} references '{entity}'. "
+                f"Review the original filing for full context."
+            )
+            results.append({
+                "date":    file_date,
+                "type":    form_type,
+                "summary": _guard_language(summary),
+                "url":     filing_url,
+            })
+
+        logger.info(
+            "[RedFlags] fetch_litigation_releases(%r): %d hits", firm_name, len(results)
+        )
+        return results
 
     def _search_enforcement_releases(
         self, firm_name: str, crd_number: str

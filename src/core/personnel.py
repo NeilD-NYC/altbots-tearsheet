@@ -194,10 +194,17 @@ class PersonnelEnricher:
         raw_people = self._scrape_team_pages(website)
         logger.info(f"[Personnel] Firecrawl found {len(raw_people)} candidates")
 
-        # Tier 2: Proxycurl fallback for anyone with a LinkedIn URL but thin data
-        for person in raw_people:
+        # Tier 2: Proxycurl fallback for anyone with a LinkedIn URL but thin data.
+        # Must use enumerate + index assignment — rebinding the loop variable alone
+        # would not update raw_people and the enriched data would be silently lost.
+        for i, person in enumerate(raw_people):
             if person.linkedin_url and not _has_enough_data(person):
-                person = self._enrich_via_proxycurl(person)
+                logger.info(
+                    "[Personnel] Triggering Proxycurl for %s "
+                    "(title=%r, snippet_len=%d)",
+                    person.name, person.title or "", len(person.raw_snippet),
+                )
+                raw_people[i] = self._enrich_via_proxycurl(person)
 
         # Synthesize bios and build final profiles
         profiles: list[PersonProfile] = []
@@ -334,18 +341,22 @@ class PersonnelEnricher:
         Endpoint: GET https://nubela.co/proxycurl/api/v2/linkedin
                   ?url={linkedin_url}&use_cache=if-present&fallback_to_cache=on-error
         """
-        if not self._px_key:
+        # Read key fresh from env every call so a late-loaded .env is honoured
+        px_key = os.environ.get(PROXYCURL_API_KEY_ENV, "") or self._px_key
+        if not px_key:
             logger.warning("[Personnel] PROXYCURL_API_KEY not set — skipping Tier 2")
             return person
 
         if not person.linkedin_url:
             return person
 
+        px_headers = {"Authorization": f"Bearer {px_key}"}
+
         try:
             time.sleep(PROXYCURL_DELAY_SECONDS)
             resp = requests.get(
                 PROXYCURL_BASE,
-                headers=self._px_headers,
+                headers=px_headers,
                 params={
                     "url": person.linkedin_url,
                     "use_cache": "if-present",
