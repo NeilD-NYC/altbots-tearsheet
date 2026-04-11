@@ -1,13 +1,14 @@
-# Tearsheet Skill
+---
+name: altbots-tearsheet
+description: >
+  Generates an institutional-grade fund manager
+  intelligence brief. Use when asked for:
+  tearsheet, one-pager, manager summary,
+  ODD report, intelligence brief, research
+  report, generate report on [any manager name].
 
-## Usage
-
-Run the tearsheet generation skill via the shell script:
-
-```bash
-bash src/skill/run_tearsheet.sh <target>
-```
-
-## Description
-
-Generates a due-diligence tearsheet for a given target (person or company).
+  Produces a 2-page PDF covering SEC filings,
+  personnel, social signals and legal disclosures.
+  Output: ~/tearsheet-project/output/[manager].pdf
+  NOT investment advice. Research signals only.
+---

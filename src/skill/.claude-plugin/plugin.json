@@ -1,0 +1,8 @@
+{
+  "name": "altbots-tearsheet",
+  "description": "Institutional fund manager tearsheet generation \u2014 SEC filings, personnel, social signals, legal disclosures",
+  "author": {
+    "name": "altbots"
+  },
+  "version": "1.0.0"
+}

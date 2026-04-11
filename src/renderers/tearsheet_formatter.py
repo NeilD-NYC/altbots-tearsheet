@@ -157,6 +157,434 @@ def _build_disclosure_layers(disclosure: dict) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Markdown → Gold Copy parser  (--from-md path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_md_to_gold(md_text: str) -> dict:
+    """
+    Parse a tearsheet Markdown file (produced by _render_md or hand-edited)
+    back into a Gold Copy dict suitable for passing to _render_pdf.
+
+    Special keys injected:
+      _analyst_commentary  str   — body of an ## Analyst Commentary section
+      _parsed_red_flags    list  — flags parsed directly from the MD
+      _from_md             dict  — {"sections_present": set of normalised keys}
+    """
+    lines = md_text.splitlines()
+
+    # ── Split on H2 (##) headers ──────────────────────────────────────────────
+    sections_raw: dict = {}
+    preamble: list = []
+    cur_title: str | None = None
+    cur_lines: list = []
+
+    for line in lines:
+        m2 = re.match(r"^## (.+)$", line)
+        if m2:
+            if cur_title is None:
+                preamble = cur_lines[:]
+            else:
+                sections_raw[cur_title] = cur_lines[:]
+            cur_title = m2.group(1).strip()
+            cur_lines = []
+        else:
+            cur_lines.append(line)
+    if cur_title is not None:
+        sections_raw[cur_title] = cur_lines[:]
+    elif cur_lines:
+        preamble = cur_lines[:]
+
+    # ── Section lookup (case-insensitive keyword match) ───────────────────────
+    def _find_sec(*kws):
+        for title, content in sections_raw.items():
+            t = title.lower()
+            if all(k in t for k in kws):
+                return title, content
+        return None, None
+
+    # ── Table parsers ─────────────────────────────────────────────────────────
+    def _kv_table(sec_lines):
+        """Parse | Key | Value | table into dict."""
+        out = {}
+        for ln in sec_lines:
+            ln2 = ln.replace("\\|", "\x00")
+            m = re.match(r"^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$", ln2.strip())
+            if not m:
+                continue
+            k = m.group(1).replace("\x00", "|").strip()
+            v = m.group(2).replace("\x00", "|").strip()
+            if not k or re.match(r"^[-: ]+$", k) or k.lower() in ("field", "#"):
+                continue
+            out[k] = v
+        return out
+
+    def _pipe_table(sec_lines):
+        """Parse a pipe table → list of rows; rows[0]=header, rows[1:]=data."""
+        rows = []
+        for ln in sec_lines:
+            ln2 = ln.replace("\\|", "\x00")
+            if not ln2.strip().startswith("|"):
+                continue
+            cells = [
+                c.replace("\x00", "|").strip()
+                for c in ln2.strip().strip("|").split("|")
+            ]
+            if all(re.match(r"^[-: ]+$", c) for c in cells if c):
+                continue  # separator row
+            rows.append(cells)
+        return rows
+
+    # ── Value parsers ─────────────────────────────────────────────────────────
+    def _parse_usd(s):
+        if not s or str(s).strip() in ("—", "-", ""):
+            return None
+        s = str(s).strip().replace(",", "")
+        m = re.match(r"^\$([0-9.]+)([BMKbmk]?)$", s)
+        if not m:
+            return None
+        v = float(m.group(1))
+        suf = m.group(2).upper()
+        if suf == "B":
+            return int(v * 1_000_000_000)
+        if suf == "M":
+            return int(v * 1_000_000)
+        if suf == "K":
+            return int(v * 1_000)
+        return int(v)
+
+    def _recency(label):
+        l = re.sub(r"[\[\]]", "", label).strip().lower()
+        if "current" in l:
+            return "green"
+        if "approach" in l:
+            return "yellow"
+        if "stale" in l:
+            return "red"
+        return ""
+
+    # ── Preamble: firm name, date, CRD, CIK ──────────────────────────────────
+    firm_name = ""
+    gen_date_str = ""
+    crd_pre = ""
+    cik_pre = ""
+    for ln in preamble:
+        m = re.match(r"^# (.+)$", ln)
+        if m:
+            firm_name = m.group(1).strip()
+        m = re.search(r"Generated:\s*(.+?)$", ln)
+        if m:
+            gen_date_str = m.group(1).strip()
+        m = re.match(r"CRD:\s*`(.+?)`", ln)
+        if m:
+            crd_pre = m.group(1).strip()
+        m = re.match(r"CIK:\s*`(.+?)`", ln)
+        if m:
+            cik_pre = m.group(1).strip()
+
+    generated_at = ""
+    if gen_date_str:
+        for fmt_s in ("%b %d, %Y", "%B %d, %Y"):
+            try:
+                generated_at = (
+                    datetime.strptime(gen_date_str, fmt_s)
+                    .strftime("%Y-%m-%dT00:00:00+00:00")
+                )
+                break
+            except ValueError:
+                pass
+        if not generated_at:
+            generated_at = gen_date_str
+
+    # ── Firm Overview ─────────────────────────────────────────────────────────
+    _, ov_lines = _find_sec("firm", "overview")
+    if ov_lines is None:
+        _, ov_lines = _find_sec("overview")
+    overview: dict = {}
+    inst: dict = {}
+    _ov_present = ov_lines is not None
+    if _ov_present:
+        kv = _kv_table(ov_lines)
+        ln = kv.get("Legal Name", firm_name)
+        if not firm_name:
+            firm_name = ln
+        overview["legal_name"]          = ln
+        overview["crd"]                 = (
+            kv.get("CRD Number") or kv.get("CRD") or crd_pre or ""
+        )
+        overview["cik"]                 = kv.get("CIK") or cik_pre or ""
+        overview["website"]             = kv.get("Website", "")
+        overview["sec_registered"]      = (
+            kv.get("SEC Registered", "No").lower().strip() == "yes"
+        )
+        overview["registration_status"] = kv.get("Registration Status", "")
+        for kk, ik in (
+            ("AUM (Total)",         "aum_total_usd"),
+            ("AUM (Discretionary)", "aum_discretionary_usd"),
+        ):
+            v = _parse_usd(kv.get(kk, ""))
+            if v is not None:
+                inst[ik] = v
+        nc = kv.get("Number of Clients", "")
+        if nc and nc not in ("—", ""):
+            try:
+                inst["num_clients"] = int(nc.replace(",", ""))
+            except ValueError:
+                pass
+        ct = kv.get("Client Types", "")
+        if ct and ct != "—":
+            inst["client_types"] = [x.strip() for x in ct.split(";") if x.strip()]
+        fs = kv.get("Fee Structures", "")
+        if fs and fs != "—":
+            inst["fee_structures"] = [x.strip() for x in fs.split(";") if x.strip()]
+        adv_raw = kv.get("ADV Filing Date", "")
+        if adv_raw and adv_raw != "—":
+            m2 = re.match(r"(\S+)\s*\[([^\]]+)\]", adv_raw)
+            if m2:
+                inst["adv_filing_date"]  = m2.group(1)
+                inst["adv_recency_flag"] = _recency(m2.group(2))
+            else:
+                inst["adv_filing_date"]  = adv_raw.strip()
+
+    # ── Team Roster / Key Personnel ───────────────────────────────────────────
+    _, team_lines = _find_sec("team")
+    if team_lines is None:
+        _, team_lines = _find_sec("roster")
+    if team_lines is None:
+        _, team_lines = _find_sec("personnel")
+    _team_present = team_lines is not None
+    roster: list = []
+    if _team_present:
+        rows = _pipe_table(team_lines)
+        if len(rows) > 1:
+            hdr = [h.lower() for h in rows[0]]
+            for row in rows[1:]:
+                mem: dict = {}
+                for i, cell in enumerate(row):
+                    if i >= len(hdr):
+                        break
+                    h = hdr[i]
+                    if "name" in h:
+                        mem["name"] = cell
+                    elif "title" in h:
+                        mem["title"] = cell
+                    elif "bio" in h or "background" in h:
+                        mem["bio"] = cell
+                    elif "finra" in h or "broker" in h:
+                        mem["finra_status"] = cell
+                if mem.get("name") and mem["name"] not in ("", "—"):
+                    roster.append(mem)
+
+    # ── SEC Filing Snapshot ───────────────────────────────────────────────────
+    _, sec_lines = _find_sec("sec", "filing")
+    if sec_lines is None:
+        _, sec_lines = _find_sec("sec", "snapshot")
+    _sec_present = sec_lines is not None
+    f13: dict = {}
+    if _sec_present and sec_lines:
+        sec_text = "\n".join(sec_lines)
+        f13_blk = re.search(
+            r"### Form 13F\s*\n(.*?)(?=^###|\Z)", sec_text,
+            re.DOTALL | re.MULTILINE,
+        )
+        if f13_blk:
+            for bm in re.finditer(
+                r"^\s*[-*]\s+\*\*(.+?):\*\*\s*(.+)$",
+                f13_blk.group(1), re.MULTILINE,
+            ):
+                key = bm.group(1).strip().lower()
+                val = bm.group(2).strip()
+                if "period" in key:
+                    f13["period_of_report"] = val
+                elif "filing date" in key:
+                    m2 = re.match(r"(\S+)\s*\[([^\]]+)\]", val)
+                    if m2:
+                        f13["filing_date"]  = m2.group(1)
+                        f13["recency_flag"] = _recency(m2.group(2))
+                    else:
+                        f13["filing_date"]  = val
+                elif "total portfolio" in key or "portfolio value" in key:
+                    v = _parse_usd(val)
+                    if v is not None:
+                        f13["total_portfolio_value_usd"] = v
+                elif "positions" in key:
+                    try:
+                        f13["num_positions"] = int(val.replace(",", ""))
+                    except ValueError:
+                        f13["num_positions"] = val
+                elif "concentration" in key:
+                    pm = re.match(r"([0-9.]+)%", val)
+                    if pm:
+                        f13["concentration_top10_pct"] = float(pm.group(1))
+        hold_blk = re.search(
+            r"#### Top Holdings\s*\n(.*?)(?=^####|\Z)", sec_text,
+            re.DOTALL | re.MULTILINE,
+        )
+        if hold_blk:
+            h_rows = _pipe_table(hold_blk.group(1).splitlines())
+            if len(h_rows) > 1:
+                holdings = []
+                for row in h_rows[1:]:
+                    if len(row) < 5:
+                        continue
+                    pm = re.match(r"([0-9.]+)%", row[4].strip())
+                    sh_str = row[3].strip().replace(",", "")
+                    holdings.append({
+                        "name":             row[1].strip(),
+                        "value_usd":        _parse_usd(row[2]),
+                        "shares":           int(sh_str) if sh_str.isdigit() else 0,
+                        "pct_of_portfolio": float(pm.group(1)) if pm else 0.0,
+                    })
+                if holdings:
+                    f13["top_holdings"] = holdings
+    if f13:
+        inst["latest_13f"] = f13
+
+    # ── Social Signals ────────────────────────────────────────────────────────
+    _, sig_lines = _find_sec("social", "signal")
+    if sig_lines is None:
+        _, sig_lines = _find_sec("social")
+    _sig_present = sig_lines is not None
+    signals: list = []
+    if _sig_present and sig_lines:
+        rows = _pipe_table(sig_lines)
+        if len(rows) > 1:
+            hdr = [h.lower() for h in rows[0]]
+            for row in rows[1:]:
+                sig: dict = {}
+                for i, cell in enumerate(row):
+                    if i >= len(hdr):
+                        break
+                    h = hdr[i]
+                    if "date" in h:
+                        sig["published_date"] = cell
+                    elif "title" in h:
+                        sig["title"] = cell
+                    elif "type" in h:
+                        sig["signal_type"] = cell
+                    elif "source" in h:
+                        sig["source"] = cell
+                if sig.get("title") and sig["title"] not in ("", "—"):
+                    signals.append(sig)
+
+    # ── Red Flags ─────────────────────────────────────────────────────────────
+    _, rf_lines = _find_sec("red", "flag")
+    _rf_present = rf_lines is not None
+    parsed_flags: list = []
+    if _rf_present and rf_lines:
+        for ln in rf_lines:
+            m = re.match(r"^\s*[-*]\s+(.+)$", ln)
+            if not m:
+                continue
+            text = m.group(1).strip()
+            if "🔴" in text or "●" in text:
+                level = "red"
+            elif "🟡" in text or "▲" in text:
+                level = "yellow"
+            else:
+                level = "info"
+            text = re.sub(r"[🔴🟡🟢●▲✓]\s*", "", text).strip()
+            if text:
+                parsed_flags.append({"level": level, "message": text})
+
+    # ── Analyst Commentary (custom section) ───────────────────────────────────
+    _, ac_lines = _find_sec("analyst")
+    analyst_commentary = ""
+    if ac_lines is not None:
+        ac_parts = [
+            ln for ln in ac_lines
+            if ln.strip() and not ln.strip().startswith(">")
+        ]
+        analyst_commentary = "\n".join(ac_parts).strip()
+
+    # ── Legal Disclosures ─────────────────────────────────────────────────────
+    _, disc_lines = _find_sec("disclosure")
+    if disc_lines is None:
+        _, disc_lines = _find_sec("legal")
+    disclaimers: dict = {}
+    if disc_lines:
+        disc_text = "\n".join(disc_lines)
+        _DISC_MAP = {
+            "not investment advice":           "not_investment_advice",
+            "regulatory screening limitation": "regulatory_disclaimer",
+            "regulatory limitation":           "regulatory_disclaimer",
+            "data limitation":                 "data_limitation",
+            "confidentiality":                 "confidentiality",
+        }
+        for m in re.finditer(
+            r"\*\*([^*]+?)\.\*\*\s+(.+?)(?=\n\*\*|\Z)", disc_text, re.DOTALL
+        ):
+            raw_lbl = m.group(1).strip().lower()
+            text    = m.group(2).strip()
+            for pat, key in _DISC_MAP.items():
+                if pat in raw_lbl:
+                    disclaimers[key] = text
+                    break
+    if not disclaimers:
+        disclaimers = {
+            "not_investment_advice":
+                "For informational purposes only. Not investment advice.",
+            "regulatory_disclaimer":
+                "Based on public records. Does not replace an ODD review.",
+            "data_limitation":
+                "Data from public filings. No warranty of accuracy.",
+            "confidentiality":
+                "Intended solely for the recipient. Redistribution prohibited.",
+        }
+
+    # ── Data Provenance ───────────────────────────────────────────────────────
+    _, dp_lines = _find_sec("data", "provenance")
+    data_sources: list = []
+    if dp_lines:
+        for ln in dp_lines:
+            m = re.match(r"^\s*[-*]\s+(.+)$", ln)
+            if m:
+                data_sources.append(m.group(1).strip())
+
+    # ── Track which sections were present ─────────────────────────────────────
+    _present: set = set()
+    if _ov_present:
+        _present.add("firm_overview")
+    if _team_present:
+        _present.add("team_roster")
+    if _sec_present:
+        _present.add("sec_filing_snapshot")
+    if _sig_present:
+        _present.add("social_signals")
+    if _rf_present:
+        _present.add("red_flags")
+    if analyst_commentary:
+        _present.add("analyst_commentary")
+
+    # ── Assemble Gold Copy dict ───────────────────────────────────────────────
+    gold: dict = {
+        "firm_name":             firm_name,
+        "generated_at":          generated_at,
+        "is_legal_ready":        True,
+        "firm_overview":         overview,
+        "institutional_numbers": inst,
+        "team_roster":           roster,
+        "social_signals":        signals,
+        "sec_enforcement":       [],
+        "form_d_filings":        [],
+        "sanctions_screening":   None,
+        "performance":           None,
+        "modules_skipped":       {},
+        "data_sources":          data_sources,
+        "disclosure": {
+            "version":          "1.0",
+            "data_sources":     data_sources,
+            "modules_skipped":  {},
+            "disclaimers":      disclaimers,
+        },
+        "_analyst_commentary":   analyst_commentary,
+        "_from_md":              {"sections_present": _present},
+    }
+    if parsed_flags:
+        gold["_parsed_red_flags"] = parsed_flags
+    return gold
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PDF renderer
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -440,6 +868,44 @@ def _render_pdf(gold: dict, out_path: Path) -> Path:
     # ══════════════════════════════════════════════════════════════════════════
     story = []
 
+    # ── From-MD section gating ────────────────────────────────────────────────
+    _from_md_info = gold.get("_from_md") or {}
+    _secs_present = _from_md_info.get("sections_present")  # None → show all
+
+    def _should_render(key: str) -> bool:
+        return _secs_present is None or key in _secs_present
+
+    # ── Analyst Commentary box (from-md only): rendered first on page 1 ───────
+    _ac_text = (gold.get("_analyst_commentary") or "").strip()
+    if _ac_text:
+        _ac_title_sty = ParagraphStyle(
+            "_ac_title", parent=base["Normal"],
+            fontName="Helvetica-Bold", fontSize=9,
+            textColor=GOLD, leading=12, spaceAfter=4,
+        )
+        _ac_body_sty = ParagraphStyle(
+            "_ac_body", parent=base["Normal"],
+            fontName="Helvetica-Oblique", fontSize=8.5,
+            textColor=WHITE, leading=12,
+        )
+        _ac_box = Table(
+            [
+                [Paragraph("ANALYST COMMENTARY", _ac_title_sty)],
+                [Paragraph(_ac_text.replace("\n", "<br/>"), _ac_body_sty)],
+            ],
+            colWidths=[CONTENT_W],
+        )
+        _ac_box.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), NAVY),
+            ("BOX",           (0, 0), (-1, -1), 2,    GOLD),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",    (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(_ac_box)
+        story.append(Spacer(1, 8))
+
     # ─────────────────────────────────────────────────────────────────────────
     # PAGE 1  — Firm Overview + Team Roster
     # ─────────────────────────────────────────────────────────────────────────
@@ -469,6 +935,10 @@ def _render_pdf(gold: dict, out_path: Path) -> Path:
         ov_rows.append(("CIK", overview["cik"]))
     if overview.get("website"):
         ov_rows.append(("Website", _trunc(_safe(overview["website"]).lower(), 60)))
+    if overview.get("inception_year"):
+        ov_rows.append(("Inception Year", str(overview["inception_year"])))
+    if overview.get("hq_city"):
+        ov_rows.append(("HQ City", overview["hq_city"]))
     ov_rows.append(("SEC Registered",
                     "Yes" if overview.get("sec_registered") else "No"))
     ov_rows.append(("Registration Status",
@@ -509,10 +979,6 @@ def _render_pdf(gold: dict, out_path: Path) -> Path:
     story.append(tbl)
 
     # ── Section 2: Team Roster ────────────────────────────────────────────────
-    story.append(Spacer(1, 10))
-    story.append(Paragraph("Team Roster", sty["h1"]))
-    story.append(navy_rule())
-
     roster = gold.get("team_roster") or []
 
     def _finra_style(val: str):
@@ -528,115 +994,118 @@ def _render_pdf(gold: dict, out_path: Path) -> Path:
                               fontName="Helvetica", fontSize=7,
                               textColor=col, leading=10)
 
-    if roster:
-        headers  = ["Name", "Title", "Professional Background", "FINRA / BrokerCheck"]
-        col_w2   = [1.20 * inch, 1.55 * inch,
-                    CONTENT_W - 2.75 * inch - 1.0 * inch, 1.0 * inch]
-        tdata2   = [[Paragraph(h, sty["tbl_hdr"]) for h in headers]]
-        page_rows = roster[:6]
-        for member in page_rows:
-            bio_text    = _trunc(_safe(member.get("bio"), "Profile available upon request."), 300)
-            finra_val   = str(member.get("finra_status") or "Not queried")
-            tdata2.append([
-                Paragraph(_safe(member.get("name")),  sty["tbl_cell"]),
-                Paragraph(_safe(member.get("title")), sty["tbl_cell"]),
-                Paragraph(bio_text,                   sty["tbl_cell_sm"]),
-                Paragraph(finra_val,                  _finra_style(finra_val)),
-            ])
-        # Overflow note row
-        overflow = len(roster) - 6
-        if overflow > 0:
-            note_sty = ParagraphStyle("roster_note", parent=base["Normal"],
-                                      fontName="Helvetica-Oblique", fontSize=6.5,
-                                      textColor=colors.HexColor("#555555"), leading=9)
-            tdata2.append([
-                Paragraph(
-                    f"+ {overflow} additional personnel on file. "
-                    "Full roster available on request.",
-                    note_sty,
-                ), "", "", "",
-            ])
-        tbl2 = Table(tdata2, colWidths=col_w2, repeatRows=1)
-        _note_row = len(tdata2) - 1 if overflow > 0 else None
-        _tbl2_style = [
-            ("BACKGROUND",    (0, 0), (-1, 0),   NAVY),
-            ("TEXTCOLOR",     (0, 0), (-1, 0),   WHITE),
-            ("VALIGN",        (0, 0), (-1, -1),  "TOP"),
-            ("ROWBACKGROUNDS",(0, 1), (-1, -1),  [WHITE, GRAY_LITE]),
-            ("LEFTPADDING",   (0, 0), (-1, -1),  4),
-            ("RIGHTPADDING",  (0, 0), (-1, -1),  4),
-            ("TOPPADDING",    (0, 0), (-1, -1),  3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1),  3),
-            ("GRID",          (0, 0), (-1, -1),  0.25, colors.HexColor("#C0C0C0")),
-        ]
-        if _note_row is not None:
-            _tbl2_style += [
-                ("SPAN",          (0, _note_row), (-1, _note_row)),
-                ("BACKGROUND",    (0, _note_row), (-1, _note_row), GRAY_LITE),
+    if _should_render("team_roster"):
+        story.append(Spacer(1, 10))
+        story.append(Paragraph("Team Roster", sty["h1"]))
+        story.append(navy_rule())
+        if roster:
+            headers  = ["Name", "Title", "Professional Background", "FINRA / BrokerCheck"]
+            col_w2   = [1.20 * inch, 1.55 * inch,
+                        CONTENT_W - 2.75 * inch - 1.0 * inch, 1.0 * inch]
+            tdata2   = [[Paragraph(h, sty["tbl_hdr"]) for h in headers]]
+            page_rows = roster[:6]
+            for member in page_rows:
+                bio_text    = _trunc(_safe(member.get("bio"), "Profile available upon request."), 300)
+                finra_val   = str(member.get("finra_status") or "Not queried")
+                tdata2.append([
+                    Paragraph(_safe(member.get("name")),  sty["tbl_cell"]),
+                    Paragraph(_safe(member.get("title")), sty["tbl_cell"]),
+                    Paragraph(bio_text,                   sty["tbl_cell_sm"]),
+                    Paragraph(finra_val,                  _finra_style(finra_val)),
+                ])
+            overflow = len(roster) - 6
+            if overflow > 0:
+                note_sty = ParagraphStyle("roster_note", parent=base["Normal"],
+                                          fontName="Helvetica-Oblique", fontSize=6.5,
+                                          textColor=colors.HexColor("#555555"), leading=9)
+                tdata2.append([
+                    Paragraph(
+                        f"+ {overflow} additional personnel on file. "
+                        "Full roster available on request.",
+                        note_sty,
+                    ), "", "", "",
+                ])
+            tbl2 = Table(tdata2, colWidths=col_w2, repeatRows=1)
+            _note_row = len(tdata2) - 1 if overflow > 0 else None
+            _tbl2_style = [
+                ("BACKGROUND",    (0, 0), (-1, 0),   NAVY),
+                ("TEXTCOLOR",     (0, 0), (-1, 0),   WHITE),
+                ("VALIGN",        (0, 0), (-1, -1),  "TOP"),
+                ("ROWBACKGROUNDS",(0, 1), (-1, -1),  [WHITE, GRAY_LITE]),
+                ("LEFTPADDING",   (0, 0), (-1, -1),  4),
+                ("RIGHTPADDING",  (0, 0), (-1, -1),  4),
+                ("TOPPADDING",    (0, 0), (-1, -1),  3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1),  3),
+                ("GRID",          (0, 0), (-1, -1),  0.25, colors.HexColor("#C0C0C0")),
             ]
-        tbl2.setStyle(TableStyle(_tbl2_style))
-        story.append(tbl2)
-        story.append(Paragraph(
-            f"Source: AltBots team profiles pipeline · {len(roster)} member(s) · "
-            f"Bios synthesized by Claude Haiku",
-            sty["italic"],
-        ))
-    else:
-        _empty_sty = ParagraphStyle("roster_empty", parent=base["Normal"],
-                                    fontName="Helvetica-Oblique", fontSize=6.5,
-                                    textColor=colors.HexColor("#555555"), leading=9)
-        headers  = ["Name", "Title", "Professional Background", "FINRA / BrokerCheck"]
-        col_w2   = [1.20 * inch, 1.55 * inch,
-                    CONTENT_W - 2.75 * inch - 1.0 * inch, 1.0 * inch]
-        tdata2   = [[Paragraph(h, sty["tbl_hdr"]) for h in headers],
-                    [Paragraph("Personnel data unavailable for this entity.",
-                               _empty_sty), "", "", ""]]
-        tbl2 = Table(tdata2, colWidths=col_w2)
-        tbl2.setStyle(TableStyle([
-            ("BACKGROUND",   (0, 0), (-1, 0),  NAVY),
-            ("TEXTCOLOR",    (0, 0), (-1, 0),  WHITE),
-            ("SPAN",         (0, 1), (-1, 1)),
-            ("LEFTPADDING",  (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-            ("TOPPADDING",   (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
-            ("GRID",         (0, 0), (-1, -1), 0.25, colors.HexColor("#C0C0C0")),
-        ]))
-        story.append(tbl2)
+            if _note_row is not None:
+                _tbl2_style += [
+                    ("SPAN",          (0, _note_row), (-1, _note_row)),
+                    ("BACKGROUND",    (0, _note_row), (-1, _note_row), GRAY_LITE),
+                ]
+            tbl2.setStyle(TableStyle(_tbl2_style))
+            story.append(tbl2)
+            story.append(Paragraph(
+                f"Source: AltBots team profiles pipeline · {len(roster)} member(s) · "
+                f"Bios synthesized by Claude Haiku",
+                sty["italic"],
+            ))
+        else:
+            _empty_sty = ParagraphStyle("roster_empty", parent=base["Normal"],
+                                        fontName="Helvetica-Oblique", fontSize=6.5,
+                                        textColor=colors.HexColor("#555555"), leading=9)
+            headers  = ["Name", "Title", "Professional Background", "FINRA / BrokerCheck"]
+            col_w2   = [1.20 * inch, 1.55 * inch,
+                        CONTENT_W - 2.75 * inch - 1.0 * inch, 1.0 * inch]
+            tdata2   = [[Paragraph(h, sty["tbl_hdr"]) for h in headers],
+                        [Paragraph("Personnel data unavailable for this entity.",
+                                   _empty_sty), "", "", ""]]
+            tbl2 = Table(tdata2, colWidths=col_w2)
+            tbl2.setStyle(TableStyle([
+                ("BACKGROUND",   (0, 0), (-1, 0),  NAVY),
+                ("TEXTCOLOR",    (0, 0), (-1, 0),  WHITE),
+                ("SPAN",         (0, 1), (-1, 1)),
+                ("LEFTPADDING",  (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING",   (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
+                ("GRID",         (0, 0), (-1, -1), 0.25, colors.HexColor("#C0C0C0")),
+            ]))
+            story.append(tbl2)
 
     # ── Section 2b: Social Signals (page 1) ──────────────────────────────────
-    story.append(Spacer(1, 4))
-    story.append(Paragraph("Social Signals  (Exa · Claude Haiku · Last 90 Days)", sty["h1"]))
-    story.append(navy_rule())
-
     signals = gold.get("social_signals") or []
-    if signals:
-        s_headers = ["Date", "Title", "Source", "Type"]
-        s_widths  = [0.75*inch, 3.20*inch, 0.80*inch, CONTENT_W - 4.75*inch]
-        s_data    = [[Paragraph(h, sty["tbl_hdr"]) for h in s_headers]]
-        for sig in signals[:5]:
-            pub = sig.get("published_date", "")
-            s_data.append([
-                Paragraph(_fmt_date(pub)[:10],                   sty["tbl_cell_sm"]),
-                Paragraph(_trunc(_safe(sig.get("title")), 80),   sty["tbl_cell_sm"]),
-                Paragraph(_safe(sig.get("source", "—")),         sty["tbl_cell_sm"]),
-                Paragraph(_safe(sig.get("signal_type", "—")),    sty["tbl_cell_sm"]),
-            ])
-        tbl_s = Table(s_data, colWidths=s_widths, repeatRows=1)
-        tbl_s.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, 0),  NAVY),
-            ("TEXTCOLOR",     (0, 0), (-1, 0),  WHITE),
-            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-            ("ROWBACKGROUNDS",(0, 1), (-1, -1), [WHITE, GRAY_LITE]),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 3),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 3),
-            ("TOPPADDING",    (0, 0), (-1, -1), 2),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ("GRID",          (0, 0), (-1, -1), 0.25, colors.HexColor("#C0C0C0")),
-        ]))
-        story.append(tbl_s)
-    else:
-        story.append(Paragraph("No social signals retrieved.", sty["italic"]))
+    if _should_render("social_signals"):
+        story.append(Spacer(1, 4))
+        story.append(Paragraph("Social Signals  (Exa · Claude Haiku · Last 90 Days)", sty["h1"]))
+        story.append(navy_rule())
+        if signals:
+            s_headers = ["Date", "Title", "Source", "Type"]
+            s_widths  = [0.75*inch, 3.20*inch, 0.80*inch, CONTENT_W - 4.75*inch]
+            s_data    = [[Paragraph(h, sty["tbl_hdr"]) for h in s_headers]]
+            for sig in signals[:5]:
+                pub = sig.get("published_date", "")
+                s_data.append([
+                    Paragraph(_fmt_date(pub)[:10],                   sty["tbl_cell_sm"]),
+                    Paragraph(_trunc(_safe(sig.get("title")), 80),   sty["tbl_cell_sm"]),
+                    Paragraph(_safe(sig.get("source", "—")),         sty["tbl_cell_sm"]),
+                    Paragraph(_safe(sig.get("signal_type", "—")),    sty["tbl_cell_sm"]),
+                ])
+            tbl_s = Table(s_data, colWidths=s_widths, repeatRows=1)
+            tbl_s.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, 0),  NAVY),
+                ("TEXTCOLOR",     (0, 0), (-1, 0),  WHITE),
+                ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS",(0, 1), (-1, -1), [WHITE, GRAY_LITE]),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 3),
+                ("TOPPADDING",    (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("GRID",          (0, 0), (-1, -1), 0.25, colors.HexColor("#C0C0C0")),
+            ]))
+            story.append(tbl_s)
+        else:
+            story.append(Paragraph("No social signals retrieved.", sty["italic"]))
 
     # ─────────────────────────────────────────────────────────────────────────
     # PAGE 2  — SEC Snapshot + Sanctions + Performance + Red Flags + Disclosure
@@ -1004,21 +1473,22 @@ def _render_pdf(gold: dict, out_path: Path) -> Path:
         ))
 
     # ── Section 4 (page 2): Red Flags & Observations ─────────────────────────
-    story.append(Spacer(1, 4))
-    story.append(Paragraph("Red Flags & Observations", sty["h1"]))
-    story.append(navy_rule())
-
-    flag_colors = {"red": RED_COL, "yellow": AMBER_COL, "info": GREEN_COL}
-    flag_icons  = {"red": "●", "yellow": "▲", "info": "✓"}
-    for flag in _derive_red_flags(gold):
-        lvl   = flag["level"]
-        col   = flag_colors.get(lvl, GRAY_MID)
-        icon  = flag_icons.get(lvl, "·")
-        hex_c = f"#{int(col.red*255):02X}{int(col.green*255):02X}{int(col.blue*255):02X}"
-        story.append(Paragraph(
-            f'<font color="{hex_c}"><b>{icon}</b></font>  {flag["message"]}',
-            sty["body_sm"],
-        ))
+    if _should_render("red_flags"):
+        story.append(Spacer(1, 4))
+        story.append(Paragraph("Red Flags & Observations", sty["h1"]))
+        story.append(navy_rule())
+        _flags = gold.get("_parsed_red_flags") or _derive_red_flags(gold)
+        flag_colors = {"red": RED_COL, "yellow": AMBER_COL, "info": GREEN_COL}
+        flag_icons  = {"red": "●", "yellow": "▲", "info": "✓"}
+        for flag in _flags:
+            lvl   = flag["level"]
+            col   = flag_colors.get(lvl, GRAY_MID)
+            icon  = flag_icons.get(lvl, "·")
+            hex_c = f"#{int(col.red*255):02X}{int(col.green*255):02X}{int(col.blue*255):02X}"
+            story.append(Paragraph(
+                f'<font color="{hex_c}"><b>{icon}</b></font>  {flag["message"]}',
+                sty["body_sm"],
+            ))
 
     # ── Disclosure attribution block ──────────────────────────────────────────
     # The full four-layer disclosure is rendered in the canvas footer on every
@@ -1309,6 +1779,20 @@ class TearsheetFormatter:
         if fmt == "md":
             return _render_md(gold, Path(out_path))
         return _render_json(gold, Path(out_path))
+
+    def parse_md(self, md_path: Path) -> dict:
+        """
+        Parse a tearsheet Markdown file into a Gold Copy dict.
+
+        Parameters
+        ----------
+        md_path : Path to the .md file produced by _render_md (or hand-edited).
+
+        Returns
+        -------
+        Gold Copy dict with ``is_legal_ready=True``.
+        """
+        return _parse_md_to_gold(Path(md_path).read_text(encoding="utf-8"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

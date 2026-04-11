@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "altbots-local",
+  "description": "AltBots local plugin marketplace",
+  "owner": {
+    "name": "altbots"
+  },
+  "plugins": [
+    {
+      "name": "altbots-tearsheet",
+      "description": "Institutional fund manager tearsheet generation",
+      "source": {
+        "source": "path",
+        "path": "/root/tearsheet-project/src/skill"
+      },
+      "category": "productivity"
+    }
+  ]
+}
