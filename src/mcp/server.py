@@ -2,8 +2,7 @@
 src/mcp/server.py — AltBots Research Tool Server  (port 8200)
 
 Standalone FastAPI application exposing four research tools via a simple
-JSON-over-HTTP interface. Also retains the legacy MCP SSE server objects
-for backward compat with src/api/main.py.
+JSON-over-HTTP interface and a full MCP SSE transport.
 
 Standalone usage
 ----------------
@@ -11,8 +10,10 @@ Standalone usage
 
 Endpoints
 ---------
-  GET  /health       — liveness + tool count + managers indexed
-  POST /messages     — {"tool": "<name>", "input": {...}} → JSON response
+  GET  /health           — liveness + tool count + managers indexed
+  POST /messages         — {"tool": "<name>", "input": {...}} → JSON response
+  GET  /sse              — MCP SSE transport (open stream, receive endpoint event)
+  POST /sse/messages     — MCP JSON-RPC messages from client → SSE stream response
 
 Tools
 -----
@@ -36,10 +37,10 @@ import json
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-# ── Legacy MCP SSE objects — kept for src/api/main.py import compat ──────────
+# ── MCP SDK ───────────────────────────────────────────────────────────────────
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool
+from mcp.types import TextContent, Tool
 
 from src.mcp.disclosure import wrap_with_disclosure
 
@@ -52,17 +53,35 @@ _SAMPLE_DIR   = Path("/var/www/html/sample")
 _SAMPLE_URL   = "https://api.altbots.io/sample"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Legacy MCP SSE server  (retained for src/api/main.py)
+# MCP server + legacy SSE transport (retained for src/api/main.py import compat)
 # ─────────────────────────────────────────────────────────────────────────────
 
 mcp_server    = Server("altbots-manager-research-signals")
-sse_transport = SseServerTransport("/messages/")
+sse_transport = SseServerTransport("/messages/")   # legacy — do not remove
 
 
 @mcp_server.list_tools()
 async def _mcp_list_tools() -> list[Tool]:
-    """Stub — tools are served via the REST /messages endpoint."""
-    return []
+    return [
+        Tool(
+            name=t["name"],
+            description=t["description"],
+            inputSchema=t["inputSchema"],
+        )
+        for t in _TOOL_DEFINITIONS
+    ]
+
+
+@mcp_server.call_tool()
+async def _mcp_call_tool(name: str, arguments: dict) -> list[TextContent]:
+    handler = _TOOLS.get(name)
+    if handler is None:
+        return [TextContent(type="text", text=json.dumps({
+            "error":       f"Unknown tool: {name!r}",
+            "known_tools": list(_TOOLS.keys()),
+        }))]
+    result = await handler(arguments or {})
+    return [TextContent(type="text", text=json.dumps(result, default=str))]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -421,6 +440,13 @@ _TOOLS: dict[str, Any] = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SSE transport for the FastAPI /sse endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+_sse_transport = SseServerTransport("/sse/messages")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -473,4 +499,40 @@ async def handle_message(request: Request) -> JSONResponse:
     return Response(
         content=json.dumps(result, default=str),
         media_type="application/json",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE endpoints  (MCP SSE transport)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/sse", tags=["mcp"])
+async def sse_endpoint(request: Request) -> None:
+    """
+    MCP SSE transport — open a Server-Sent Events stream.
+
+    On connect the server emits an ``endpoint`` event containing the URL the
+    client must POST JSON-RPC messages to::
+
+        event: endpoint
+        data: /sse/messages?session_id=<uuid>
+
+    The stream then carries all MCP responses (initialize, tools/list,
+    tools/call results, etc.) as ``message`` events.
+    """
+    async with _sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await mcp_server.run(
+            streams[0],
+            streams[1],
+            mcp_server.create_initialization_options(),
+        )
+
+
+@app.post("/sse/messages", tags=["mcp"])
+async def sse_messages(request: Request) -> None:
+    """Receive MCP JSON-RPC messages from the client and route them to the SSE stream."""
+    await _sse_transport.handle_post_message(
+        request.scope, request.receive, request._send
     )
