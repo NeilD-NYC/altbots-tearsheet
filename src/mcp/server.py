@@ -26,8 +26,12 @@ Tools
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
+import os
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +55,108 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _OUTPUT_DIR   = _PROJECT_ROOT / "output"
 _SAMPLE_DIR   = Path("/var/www/html/sample")
 _SAMPLE_URL   = "https://api.altbots.io/sample"
+_KEYS_FILE    = _PROJECT_ROOT / "config" / "api_keys.json"
+_CUSTOMER_LOG = _PROJECT_ROOT / "logs" / "new_customers.log"
+
+# ── Stripe config (optional — MVP degrades gracefully without these) ──────────
+_STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
+_STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+if not _STRIPE_SECRET_KEY:
+    logging.warning("STRIPE_SECRET_KEY not set — Stripe API calls disabled")
+if not _STRIPE_WEBHOOK_SECRET:
+    logging.warning("STRIPE_WEBHOOK_SECRET not set — webhook signature verification disabled")
+
+# ── Tier definitions ──────────────────────────────────────────────────────────
+_FREE_TOOLS = {
+    "list_available_managers",
+    "get_manager_coverage",
+    "get_pipeline_status",
+}
+_PRO_TOOLS = {
+    "generate_manager_tearsheet",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API key store (config/api_keys.json)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_keys() -> dict:
+    try:
+        return json.loads(_KEYS_FILE.read_text(encoding="utf-8")) if _KEYS_FILE.exists() else {}
+    except Exception:
+        return {}
+
+
+def _save_keys(keys: dict) -> None:
+    _KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _KEYS_FILE.write_text(json.dumps(keys, indent=2), encoding="utf-8")
+
+
+def _extract_api_key(request: Request) -> str | None:
+    """Pull API key from Authorization: Bearer ak_... or x-api-key header."""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        candidate = auth[7:].strip()
+        if candidate.startswith("ak_"):
+            return candidate
+    xkey = request.headers.get("x-api-key", "").strip()
+    if xkey.startswith("ak_"):
+        return xkey
+    return None
+
+
+def _validate_key(key: str) -> tuple[bool, dict | None]:
+    """Return (is_valid, entry).  is_valid=False if missing or inactive."""
+    keys = _load_keys()
+    entry = keys.get(key)
+    if entry is None or not entry.get("active"):
+        return False, entry
+    return True, entry
+
+
+def _record_usage(key: str) -> None:
+    """Increment usage_count and update last_used in place."""
+    keys = _load_keys()
+    if key in keys:
+        keys[key]["usage_count"] = keys[key].get("usage_count", 0) + 1
+        keys[key]["last_used"]   = datetime.now(timezone.utc).isoformat()
+        _save_keys(keys)
+
+
+def _provision_key(name: str, email: str, plan: str = "pro") -> str:
+    """Generate and persist a new API key; returns the key string."""
+    import random, string
+    chars = string.ascii_letters + string.digits
+    keys  = _load_keys()
+    key   = "ak_" + "".join(random.choices(chars, k=12))
+    while key in keys:
+        key = "ak_" + "".join(random.choices(chars, k=12))
+    keys[key] = {
+        "name":        name,
+        "email":       email,
+        "plan":        plan,
+        "active":      True,
+        "created_at":  datetime.now(timezone.utc).isoformat(),
+        "last_used":   None,
+        "usage_count": 0,
+    }
+    _save_keys(keys)
+    return key
+
+
+def _deactivate_by_email(email: str) -> bool:
+    """Set active=False for all keys matching email. Returns True if any found."""
+    keys    = _load_keys()
+    changed = False
+    for entry in keys.values():
+        if entry.get("email", "").lower() == email.lower() and entry.get("active"):
+            entry["active"] = False
+            changed = True
+    if changed:
+        _save_keys(keys)
+    return changed
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MCP server + legacy SSE transport (retained for src/api/main.py import compat)
@@ -495,6 +601,31 @@ async def handle_message(request: Request) -> JSONResponse:
             },
         )
 
+    # ── Auth gate ─────────────────────────────────────────────────────────────
+    if tool_name in _PRO_TOOLS:
+        api_key = _extract_api_key(request)
+        if api_key is None:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error":       "api_key_required",
+                    "message":     "This tool requires a Pro API key.",
+                    "upgrade_url": "https://altbots.io/pricing",
+                    "free_tools":  sorted(_FREE_TOOLS),
+                },
+            )
+        valid, _ = _validate_key(api_key)
+        if not valid:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error":       "invalid_api_key",
+                    "message":     "API key not found or inactive.",
+                    "upgrade_url": "https://altbots.io/pricing",
+                },
+            )
+        _record_usage(api_key)
+
     result = await handler(inp)
     return Response(
         content=json.dumps(result, default=str),
@@ -536,3 +667,137 @@ async def sse_messages(request: Request) -> None:
     await _sse_transport.handle_post_message(
         request.scope, request.receive, request._send
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stripe webhook  (POST /stripe/webhook)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> bool:
+    """Manually verify Stripe webhook signature without requiring stripe.Webhook."""
+    try:
+        parts  = {k: v for k, v in (p.split("=", 1) for p in sig_header.split(",") if "=" in p)}
+        ts     = parts.get("t", "")
+        v1_sig = parts.get("v1", "")
+        signed = f"{ts}.".encode() + payload
+        expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, v1_sig)
+    except Exception:
+        return False
+
+
+def _log_new_customer(name: str, email: str, key: str) -> None:
+    _CUSTOMER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    ts   = datetime.now(timezone.utc).isoformat()
+    line = f"{ts}  key={key}  name={name!r}  email={email}\n"
+    with _CUSTOMER_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+    logger.info("New customer provisioned: %s <%s> → %s", name, email, key)
+
+
+@app.post("/stripe/webhook", tags=["billing"])
+async def stripe_webhook(request: Request) -> JSONResponse:
+    """
+    Receive and process Stripe webhook events.
+
+    Handled events
+    --------------
+    checkout.session.completed
+        Provision a new Pro API key and log to logs/new_customers.log.
+
+    customer.subscription.deleted
+        Deactivate all API keys associated with the customer's email.
+    """
+    payload    = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    # ── Signature verification ────────────────────────────────────────────────
+    if _STRIPE_WEBHOOK_SECRET:
+        if not _verify_stripe_signature(payload, sig_header, _STRIPE_WEBHOOK_SECRET):
+            logger.warning("Stripe webhook signature verification failed")
+            return JSONResponse(status_code=400, content={"error": "invalid_signature"})
+    else:
+        logger.warning("Stripe webhook received without secret — skipping verification")
+
+    try:
+        event = json.loads(payload)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid_json"})
+
+    event_type = event.get("type", "")
+    data_obj   = (event.get("data") or {}).get("object") or {}
+
+    # ── checkout.session.completed ────────────────────────────────────────────
+    if event_type == "checkout.session.completed":
+        email    = (data_obj.get("customer_details") or {}).get("email") or \
+                   data_obj.get("customer_email") or ""
+        metadata = data_obj.get("metadata") or {}
+        name     = metadata.get("firm_name") or metadata.get("name") or \
+                   (data_obj.get("customer_details") or {}).get("name") or email
+
+        if not email:
+            logger.warning("checkout.session.completed missing email — skipping key provision")
+            return JSONResponse(content={"status": "skipped", "reason": "no_email"})
+
+        key = _provision_key(name=name, email=email, plan="pro")
+        _log_new_customer(name=name, email=email, key=key)
+        return JSONResponse(content={"status": "provisioned", "key_prefix": key[:8] + "****"})
+
+    # ── customer.subscription.deleted ─────────────────────────────────────────
+    elif event_type == "customer.subscription.deleted":
+        # Fetch customer email from the subscription object
+        email = ""
+        # The subscription has customer ID; for MVP use metadata or billing_email
+        billing_email = data_obj.get("billing_email") or ""
+        metadata      = data_obj.get("metadata") or {}
+        email         = metadata.get("email") or billing_email
+
+        # Fallback: try to look up via Stripe API if secret is set
+        if not email and _STRIPE_SECRET_KEY:
+            try:
+                import stripe as _stripe
+                _stripe.api_key = _STRIPE_SECRET_KEY
+                customer_id = data_obj.get("customer")
+                if customer_id:
+                    cust  = await asyncio.to_thread(_stripe.Customer.retrieve, customer_id)
+                    email = cust.get("email", "")
+            except Exception as exc:
+                logger.warning("Stripe customer lookup failed: %s", exc)
+
+        if email:
+            found = _deactivate_by_email(email)
+            logger.info("subscription.deleted for %s — keys deactivated=%s", email, found)
+            return JSONResponse(content={"status": "deactivated", "email": email, "found": found})
+        else:
+            logger.warning("subscription.deleted — could not resolve customer email")
+            return JSONResponse(content={"status": "skipped", "reason": "no_email"})
+
+    # ── unhandled event ───────────────────────────────────────────────────────
+    logger.debug("Unhandled Stripe event: %s", event_type)
+    return JSONResponse(content={"status": "ignored", "type": event_type})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smithery config schema  (GET /.well-known/mcp/config-schema)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/.well-known/mcp/config-schema", tags=["discovery"])
+async def mcp_config_schema() -> JSONResponse:
+    """Return the Smithery-compatible config schema for this MCP server."""
+    return JSONResponse(content={
+        "configSchema": {
+            "type": "object",
+            "properties": {
+                "apiKey": {
+                    "type":        "string",
+                    "title":       "AltBots API Key",
+                    "description": (
+                        "Your AltBots Pro API key. "
+                        "Get one at altbots.io/pricing. "
+                        "Format: ak_xxxxxxxxxxxx"
+                    ),
+                    "format": "password",
+                },
+            },
+        },
+    })
